@@ -1,0 +1,26 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki
+  namespace: argocd
+spec:
+  project: default
+  sources:
+    - repoURL: https://github.com/grafana/loki.git
+      targetRevision: helm-loki-6.6.0
+      path: production/helm/loki
+      helm:
+        valueFiles:
+          - $values/loki/values.yaml
+    - repoURL: https://github.com/ffeijobg/ffeijo_observability_review.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability-platform
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

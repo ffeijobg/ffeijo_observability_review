@@ -1,0 +1,35 @@
+# New. Nothing in this repo previously deployed Prometheus/Grafana/
+# Alertmanager -- they were assumed pre-existing on the original home-lab
+# k3s cluster. A fresh kind cluster has none of that, so this Application
+# provides it, and syncs first: the ServiceMonitor CRD
+# (otel-collector/servicemonitor.yaml) and the PrometheusRule CRD (which
+# Sloth writes to, once installed in Week 3-4) both come from this chart.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kube-prometheus-stack
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  project: default
+  sources:
+    - repoURL: https://github.com/prometheus-community/helm-charts.git
+      targetRevision: kube-prometheus-stack-68.4.3 # verify with `helm search repo prometheus-community/kube-prometheus-stack --versions` before first apply -- pin whatever's actually current, don't leave this unpinned
+      path: charts/kube-prometheus-stack
+      helm:
+        valueFiles:
+          - $values/kube-prometheus-stack/values.yaml
+    - repoURL: https://github.com/ffeijobg/ffeijo_observability_review.git
+      targetRevision: main
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability-platform
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true # this chart's CRDs are large enough to hit the client-side apply annotation size limit

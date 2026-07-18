@@ -1,0 +1,26 @@
+# Root Application. Sync this one and it recursively deploys every child
+# Application defined under argocd/apps/ -- OTel Collector, Tempo, Loki,
+# and the Sloth SLO rules. This is the single command that stands up the
+# whole platform from a clean cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: observability-platform
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ffeijobg/ffeijo_observability_review.git
+    targetRevision: main
+    path: argocd/apps
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability-platform
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
