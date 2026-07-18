@@ -1,0 +1,33 @@
+# Sloth SLO spec -- SLO-as-code. Sloth reads this CRD and auto-generates the
+# underlying Prometheus recording rules + multi-window, multi-burn-rate
+# alerting rules (the same pattern Google's SRE workbook recommends), so you
+# never hand-write burn-rate PromQL yourself.
+apiVersion: sloth.slok.dev/v1
+kind: PrometheusServiceLevel
+metadata:
+  name: demo-3tier-app-availability
+  namespace: observability-platform
+spec:
+  service: "demo-3tier-app"
+  labels:
+    platform.tenant: "demo-3tier-app"
+  slos:
+    - name: "requests-availability"
+      objective: 99.5
+      description: "99.5% of HTTP requests to demo-3tier-app succeed (non-5xx) over 30 days."
+      sli:
+        events:
+          errorQuery: |
+            sum(rate(http_server_duration_count{platform_tenant="demo-3tier-app", http_status_code=~"5.."}[{{.window}}]))
+          totalQuery: |
+            sum(rate(http_server_duration_count{platform_tenant="demo-3tier-app"}[{{.window}}]))
+      alerting:
+        name: DemoAppAvailabilityBurnRate
+        labels:
+          severity_routing: "true"
+        pageAlert:
+          labels:
+            severity: page
+        ticketAlert:
+          labels:
+            severity: ticket

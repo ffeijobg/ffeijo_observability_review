@@ -1,0 +1,27 @@
+apiVersion: sloth.slok.dev/v1
+kind: PrometheusServiceLevel
+metadata:
+  name: demo-3tier-app-latency
+  namespace: observability-platform
+spec:
+  service: "demo-3tier-app"
+  labels:
+    platform.tenant: "demo-3tier-app"
+  slos:
+    - name: "requests-latency-500ms"
+      objective: 99.0
+      description: "99% of HTTP requests to demo-3tier-app complete in under 500ms over 30 days."
+      sli:
+        events:
+          errorQuery: |
+            sum(rate(http_server_duration_bucket{platform_tenant="demo-3tier-app", le="0.5"}[{{.window}}]))
+          totalQuery: |
+            sum(rate(http_server_duration_count{platform_tenant="demo-3tier-app"}[{{.window}}]))
+      alerting:
+        name: DemoAppLatencyBurnRate
+        pageAlert:
+          labels:
+            severity: page
+        ticketAlert:
+          labels:
+            severity: ticket

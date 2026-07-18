@@ -1,0 +1,28 @@
+# Helm values for grafana/tempo chart (single-binary mode -- right-sized for a
+# home lab; production would use the microservices/distributed chart instead).
+tempo:
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+  retention: 48h
+
+server:
+  http_listen_port: 3200
+
+# Expose OTLP receivers natively on Tempo too (belt-and-suspenders --
+# the Collector is the primary ingest path, but this lets you send test
+# traces directly to Tempo while debugging).
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+persistence:
+  enabled: true
+  size: 10Gi

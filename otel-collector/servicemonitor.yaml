@@ -1,0 +1,17 @@
+# Consumed by kube-prometheus-stack's Prometheus Operator (this repo's own
+# argocd/apps/kube-prometheus-stack.yaml, synced first via sync-wave "-1" so
+# this CRD exists before this file's ArgoCD Application tries to apply it).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: otel-collector-gateway
+  namespace: observability-platform
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector-gateway
+  endpoints:
+    - port: metrics
+      interval: 15s

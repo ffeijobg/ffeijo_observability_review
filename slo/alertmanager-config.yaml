@@ -1,0 +1,30 @@
+# Reference copy for docs/the game-day runbook -- the config that's actually
+# live is kube-prometheus-stack/values.yaml's `alertmanager.config` block
+# (kept in sync with this file by hand). This repo's Alertmanager is
+# provisioned by the Prometheus Operator (via kube-prometheus-stack), which
+# reads its config from a chart-managed Secret, not from a standalone
+# ConfigMap like this one -- applying this file directly does nothing.
+# Routes Sloth's page/ticket severities to a chat webhook -- stand-in for
+# xMatter/PagerDuty in production.
+route:
+  receiver: default-ticket
+  routes:
+    - matchers:
+        - severity = "page"
+      receiver: chat-webhook-urgent
+      continue: false
+    - matchers:
+        - severity = "ticket"
+      receiver: chat-webhook-ticket
+      continue: false
+
+receivers:
+  - name: default-ticket
+    webhook_configs:
+      - url: "https://REPLACE_ME.webhook.example/ticket"
+  - name: chat-webhook-urgent
+    webhook_configs:
+      - url: "https://REPLACE_ME.webhook.example/urgent"
+  - name: chat-webhook-ticket
+    webhook_configs:
+      - url: "https://REPLACE_ME.webhook.example/ticket"

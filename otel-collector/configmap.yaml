@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: observability-platform
+data:
+  collector-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      memory_limiter:
+        check_interval: 2s
+        limit_mib: 400
+        spike_limit_mib: 100
+
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+
+      # Tags every span/metric/log with which "tenant" (namespace/service) it
+      # came from -- this is what makes folder-per-tenant routing in Grafana
+      # and per-tenant SLOs possible downstream.
+      resource:
+        attributes:
+          - key: platform.tenant
+            from_attribute: service.namespace
+            action: upsert
+
+      # Tail sampling: keep all errors and slow requests, sample the rest.
+      # This is the real interview talking point -- sampling strategy at
+      # ingestion, not "we just export everything."
+      tail_sampling:
+        decision_wait: 10s
+        num_traces: 50000
+        policies:
+          - name: errors-policy
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: slow-traces-policy
+            type: latency
+            latency:
+              threshold_ms: 500
+          - name: baseline-sample-policy
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 10
+
+    exporters:
+      otlp/tempo:
+        endpoint: tempo.observability-platform.svc.cluster.local:4317
+        tls:
+          insecure: true
+
+      loki:
+        endpoint: http://loki-gateway.observability-platform.svc.cluster.local/loki/api/v1/push
+
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      logging:
+        verbosity: basic
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, tail_sampling, batch]
+          exporters: [otlp/tempo, logging]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [prometheus, logging]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, batch]
+          exporters: [loki, logging]

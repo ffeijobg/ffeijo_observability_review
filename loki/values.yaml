@@ -1,0 +1,37 @@
+# Helm values for grafana/loki chart (SingleBinary / filesystem mode --
+# right-sized for a home lab; production would use simple-scalable or
+# microservices mode with object storage instead).
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2024-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+  limits_config:
+    retention_period: 72h
+
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 10Gi
+
+gateway:
+  enabled: true
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+  selfMonitoring:
+    enabled: false
+  lokiCanary:
+    enabled: false
