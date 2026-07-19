@@ -1,0 +1,117 @@
+---
+- name: Prepare Debian host for kind + observability platform
+  hosts: obs_hosts
+  become: true
+  vars:
+    kind_version: "v0.23.0"
+    kubectl_version: "v1.30.0"
+    # Must match terraform/main.tf's argocd_version -- the CLI talking to a
+    # server on a different minor version is a real, easy-to-hit failure
+    # mode, not a hypothetical one.
+    argocd_version: "v2.13.2"
+
+  tasks:
+    - name: Check whether Docker is already installed and working
+      command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker Engine
+      apt:
+        name: docker.io
+        state: present
+        update_cache: true
+      when: docker_check.rc != 0
+      # Skipped entirely if a working `docker` binary already exists, no
+      # matter how it got there (docker-ce from Docker's own apt repo, a
+      # snap, a vendor-shipped build). Installing docker.io unconditionally
+      # would fight an existing docker-ce install over /usr/bin/docker and
+      # the daemon config instead of being a harmless no-op -- exactly the
+      # kind of "breaks existing functionality" this playbook is meant to
+      # avoid on a server it didn't provision from scratch.
+
+    - name: Add the invoking user to the docker group
+      user:
+        name: "{{ ansible_facts['env']['SUDO_USER'] | default(ansible_facts['user_id']) }}"
+        groups: docker
+        append: true
+      # New group membership only takes effect in a new login shell -- not
+      # this play. Log out/in (or `newgrp docker`) once, before running
+      # `terraform apply`, or every kind/docker command below needs sudo.
+
+    - name: Ensure Docker is running and enabled
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Ensure kind is installed
+      get_url:
+        url: "https://kind.sigs.k8s.io/dl/{{ kind_version }}/kind-linux-amd64"
+        dest: /usr/local/bin/kind
+        mode: "0755"
+
+    - name: Ensure kubectl is installed
+      get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+
+    - name: Ensure helm is installed
+      shell: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+
+    - name: Ensure the argocd CLI is installed
+      get_url:
+        url: "https://github.com/argoproj/argo-cd/releases/download/{{ argocd_version }}/argocd-linux-amd64"
+        dest: /usr/local/bin/argocd
+        mode: "0755"
+      # Pinned to argocd_version, not /releases/latest/ -- a floating
+      # "latest" URL both drifts on every re-run (shows as `changed` even
+      # when nothing meaningfully changed) and risks a CLI newer than the
+      # server Terraform actually installed, which is a real
+      # incompatibility, not just cosmetic. The argocd *server* itself is
+      # installed into the cluster by Terraform (terraform/main.tf), not
+      # here -- this is only the CLI binary the training plan's
+      # `argocd login` / `argocd app sync` / `argocd app wait` commands run
+      # from the host.
+
+    - name: Ensure Terraform is installed
+      shell: |
+        curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+          | tee /etc/apt/sources.list.d/hashicorp.list
+        apt-get update
+        apt-get install -y terraform
+      args:
+        creates: /usr/bin/terraform
+
+    - name: Ensure k6 is installed
+      shell: |
+        gpg -k
+        gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+        echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+          | tee /etc/apt/sources.list.d/k6.list
+        apt-get update
+        apt-get install -y k6
+      args:
+        creates: /usr/bin/k6
+      # Week 2 (load generation) and the ci/k6-collector-smoke.js manual
+      # smoke test (Week 4) both need this -- it wasn't part of host prep
+      # before this repo assumed a pre-existing home-lab box that already
+      # had it.
+
+    - name: Confirm the tooling this playbook installed actually works
+      command: "{{ item }}"
+      loop:
+        - docker --version
+        - kind --version
+        - kubectl version --client
+        - helm version
+        - terraform version
+        - k6 version
+        - argocd version --client
+      changed_when: false
