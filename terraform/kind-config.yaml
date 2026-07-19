@@ -10,5 +10,27 @@ name: obs-platform
 
 nodes:
   - role: control-plane
+    # Static, low-level exposure for argocd-server -- NOT a general pattern
+    # for every Service in this repo (everything else uses
+    # kubectl port-forward fine). Confirmed live, repeatedly: argocd-server
+    # specifically breaks under kubectl port-forward's SPDY tunnel --
+    # "connection reset by peer" mid-request, reproduced across a browser
+    # tab, a plain CLI login, a --grpc-web CLI login, and again after
+    # switching the server to plaintext mode, while plain-HTTP forwards to
+    # every other Service on this same cluster (Grafana, Prometheus) stayed
+    # stable for 100+ minutes under the same conditions. The one thing
+    # unruled-out: even in insecure/plaintext mode, argocd-server still
+    # multiplexes gRPC (h2c) and REST/UI (HTTP/1.1) on one port via
+    # connection-preface sniffing -- a fundamentally different traffic
+    # pattern than Grafana/Prometheus's plain HTTP/1.1, and plausibly what's
+    # destabilizing under port-forward specifically. Routing around
+    # kubectl port-forward (and the apiserver proxy subresource) entirely
+    # via a plain Docker-level port publish sidesteps whatever that
+    # mechanism is, rather than chasing another CLI/server flag.
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        listenAddress: "0.0.0.0"
+        protocol: TCP
   - role: worker
   - role: worker

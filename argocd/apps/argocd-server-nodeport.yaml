@@ -1,0 +1,28 @@
+# Static, low-level exposure for argocd-server -- bypasses kubectl
+# port-forward (and the apiserver's proxy subresource) entirely via a plain
+# NodePort, routed to the host through terraform/kind-config.yaml's
+# extraPortMappings (control-plane node, hostPort 8080 -> containerPort
+# 30080). See the comment there for why: kubectl port-forward was confirmed
+# unreliable specifically against argocd-server (repeated
+# "connection reset by peer"), while every other Service on this cluster
+# stayed stable under port-forward the whole time.
+#
+# Same selector as the stock argocd-server Service from the upstream
+# install manifest -- this is an additional access path onto the same
+# pods, not a replacement for it. kubectl port-forward remains fine for
+# everything else in this repo.
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server-nodeport
+  namespace: argocd
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: argocd-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 30080
+      protocol: TCP
