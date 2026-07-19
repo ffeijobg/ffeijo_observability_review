@@ -8,8 +8,14 @@ tempo:
         path: /var/tempo/traces
   retention: 48h
 
-server:
-  http_listen_port: 3200
+# No server.http_listen_port override -- confirmed live this chart doesn't
+# honor it at this values path, and stays on its default (3100) regardless.
+# That default was originally worked around here on the assumption it'd
+# collide with Loki's own 3100 -- it doesn't: they're separate Services with
+# separate ClusterIPs, so both using 3100 internally is fine. The only place
+# this matters is the *local* side of a `kubectl port-forward` when you want
+# both open at once (see the training plan's Week 1-2 Step 5) -- forward
+# Tempo to a different local port there, not here.
 
 # Expose OTLP receivers natively on Tempo too (belt-and-suspenders --
 # the Collector is the primary ingest path, but this lets you send test
