@@ -1,6 +1,26 @@
 # Helm values for grafana/loki chart (SingleBinary / filesystem mode --
 # right-sized for a home lab; production would use simple-scalable or
 # microservices mode with object storage instead).
+
+# Required, not implied by singleBinary.replicas alone: this chart supports
+# three topologies (SingleBinary / SimpleScalable / Distributed) gated by
+# this value. Without it, the SimpleScalable topology's write/read/backend
+# components keep their own non-zero default replicas alongside
+# singleBinary's, and the chart's own validate.yaml refuses to render --
+# "more than zero replicas configured for both the single binary and simple
+# scalable targets" -- rather than guess which topology you meant.
+deploymentMode: SingleBinary
+
+# Explicitly zeroed so nothing in the SimpleScalable topology renders
+# regardless of deploymentMode -- belt-and-suspenders with the setting
+# above, and what actually satisfies the chart's validation check.
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
 loki:
   auth_enabled: false
   commonConfig:
