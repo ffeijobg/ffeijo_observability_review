@@ -66,20 +66,29 @@ data:
         resource_to_telemetry_conversion:
           enabled: true
 
-      logging:
-        verbosity: basic
+      # `debug`, not the deprecated `logging` exporter (every startup log
+      # shows "Deprecated component ... name: logging" -- it's being
+      # removed from the Collector). Same config surface, drop-in rename.
+      # verbosity: detailed (not basic) is required for Week 1 Step 5's
+      # `grep manual-test-span` check to ever find anything -- `basic` only
+      # ever logs one-line span *counts*, never the actual span name, no
+      # matter how well the pipeline is working. Fine to leave at
+      # `detailed` for this lab's traffic volume; dial back to `normal` if
+      # this were feeding real production load.
+      debug:
+        verbosity: detailed
 
     service:
       pipelines:
         traces:
           receivers: [otlp]
           processors: [memory_limiter, resource, tail_sampling, batch]
-          exporters: [otlp/tempo, logging]
+          exporters: [otlp/tempo, debug]
         metrics:
           receivers: [otlp]
           processors: [memory_limiter, resource, batch]
-          exporters: [prometheus, logging]
+          exporters: [prometheus, debug]
         logs:
           receivers: [otlp]
           processors: [memory_limiter, resource, batch]
-          exporters: [loki, logging]
+          exporters: [loki, debug]
