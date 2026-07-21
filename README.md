@@ -17,7 +17,7 @@ access (image pulls, Helm chart fetches, `apt` installs all work) but is not rea
 inbound access. ArgoCD fits this cleanly: it only ever polls the git remote over
 outbound HTTPS from inside the cluster (default every 3m) — nothing external initiates
 a connection into this host. There is deliberately no `.github/workflows/` in this repo;
-CI-style validation (the k6 smoke test in `ci/`) is run by hand, not by a pipeline.
+CI-style validation (the k6 scripts in `ci/`) is run by hand, not by a pipeline.
 
 ## Why this exists
 
@@ -36,7 +36,7 @@ flowchart LR
     end
 
     subgraph Tenants["Tenant Services (e.g. ffeijo_3tier_hardened_stack)"]
-        A1[App: OTel SDK auto-instrumented]
+        A1[App: OTel SDK manually instrumented]
     end
 
     subgraph Platform["Observability Platform (this repo, GitOps-synced by ArgoCD)"]
@@ -63,6 +63,15 @@ flowchart LR
     AM -- webhook --> Chat[Slack/Discord webhook]
 ```
 
+The tenant app's backend is instrumented by hand (`TracerProvider`/`MeterProvider`/
+`LoggerProvider` wired directly in `app.py`), not via the `opentelemetry-instrument`
+CLI — that approach doesn't work for this app at all (see `instrumentation/README.md`
+and Week 2 of the training plan for why: a multi-stage Docker build that never
+generates console-script wrappers, and no official OTel auto-instrumentor for Python's
+stdlib `http.server` in the first place). `backend/` and `database/` in this repo are
+corrected copies of the tenant app's source with the fixes that came out of that —
+see "Repo layout" below.
+
 ## Components
 
 | Layer | Tool | Role |
@@ -84,7 +93,16 @@ flowchart LR
 .
 ├── ansible/                 # Debian host prep: docker, kind, kubectl, helm, terraform
 ├── terraform/               # Cluster lifecycle: kind create/destroy, ArgoCD install, app-of-apps bootstrap
-├── k8s/                     # namespace + shared cluster resources
+├── k8s/                     # Platform namespace + the demo tenant app's manifests (corrected
+│                            #   copies — see backend/ and database/ below; frontend's Service
+│                            #   here is ClusterIP, not the source repo's NodePort, which
+│                            #   collides with argocd-server-nodeport.yaml on this cluster)
+├── backend/                 # Demo tenant app backend — corrected copy of
+│                            #   ffeijo_3tier_hardened_stack/backend/ (manual OTel SDK
+│                            #   instrumentation, fixed init-order/rollback bugs; see Week 2)
+├── database/                # Demo tenant app database — corrected copy of
+│                            #   ffeijo_3tier_hardened_stack/database/ (init.sql reordered so
+│                            #   schema setup runs before privileges are stripped; see Week 2)
 ├── otel-collector/          # OTel Collector gateway: config, deployment, service
 ├── tempo/                   # Tempo Helm values (via ArgoCD Application)
 ├── loki/                    # Loki Helm values (via ArgoCD Application)
@@ -94,7 +112,8 @@ flowchart LR
 ├── argocd/                  # App-of-apps: every component deploys from this repo
 ├── instrumentation/         # How the demo tenant app gets OTel-instrumented
 ├── chaos/                   # Game-day runbook + injection scripts + results log
-├── ci/                      # k6 smoke test — run by hand, not by a pipeline (see "Host constraint" above)
+├── ci/                      # k6 scripts (Collector smoke test + demo-app load test) — run by
+│                            #   hand, not by a pipeline (see "Host constraint" above)
 └── docs/                    # Architecture, onboarding, SLO methodology, gameday template
 ```
 
@@ -117,6 +136,12 @@ repo. Nothing after this point requires touching `kubectl apply` for the platfor
 see `FernandoFeijo_Training_Plan_NVIDIA_Observability_1.md` Phase 0 for the full
 verification sequence.
 
+The demo tenant app (`k8s/00-namespace.yaml` through `05-frontend.yaml`, plus the
+`backend/` and `database/` images) is not part of that GitOps sync — it's a separate,
+by-hand deployment, since it's the thing being validated *against* the platform rather
+than a platform component itself. See Week 2 of the training plan for the full apply +
+build + load sequence.
+
 ## Development approach
 
 This repo is built and committed **incrementally, phase by phase** (see `docs/BUILD_LOG.md`
@@ -128,7 +153,7 @@ commits with a working, demoable state at the end of it.
 | 0 | `kind` cluster + ArgoCD + `kube-prometheus-stack` bootstrapped via Terraform | ✅ verified on real hardware (`basement-nas`) |
 | 1 | OTel Collector gateway deployed via ArgoCD | ✅ verified end-to-end: trace ingest, tail-sampling, Prometheus scrape |
 | 2 | Tempo + Loki added, wired into Grafana | ✅ verified: pods healthy, TraceQL/LogQL both return `"status": "success"` |
-| 3 | Demo tenant app instrumented, k6 load validates traces end-to-end | 🔲 |
+| 3 | Demo tenant app instrumented, k6 load validates traces end-to-end | 🟡 backend instrumented, load test passing at 100% — Tempo/Loki trace-log correlation not yet confirmed |
 | 4 | Multi-tenant Grafana folder structure + onboarding doc | 🔲 |
 | 5 | SLO-as-code (Sloth) + Alertmanager burn-rate routing | 🔲 |
 | 6 | Chaos game-day: measured MTTD, documented in `chaos/results/` | 🔲 |
