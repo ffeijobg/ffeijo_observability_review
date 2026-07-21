@@ -1,0 +1,30 @@
+# 00-configmap.yaml — applied before any workload manifest
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: app-config
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: configuration
+    app.kubernetes.io/managed-by: kubectl
+data:
+  # ── Database connectivity (non-sensitive) ─────────────────────────────
+  DB_HOST:     "database"          # headless Service DNS name
+  DB_PORT:     "5432"
+  DB_NAME:     "appdb"             # db name is not a credential
+  DB_SSL_MODE: "disable"           # lab; set 'require' for production
+ 
+  # ── Backend runtime (non-sensitive) ──────────────────────────────────
+  PORT:                    "5000"
+  PYTHONDONTWRITEBYTECODE: "1"     # no .pyc files — required for readOnlyRootFilesystem
+  PYTHONUNBUFFERED:        "1"     # unbuffered stdout → logs stream to kubectl logs
+ 
+  # Note: the frontend's upstream backend hostname/port is baked into
+  # frontend/nginx.conf ('proxy_pass http://backend-service:5000/') at
+  # image build time — nginx.conf is static, not templated at container
+  # start, so there is no env-driven override to configure here. Changing
+  # the backend Service name/port requires editing nginx.conf and
+  # rebuilding the frontend image.
+

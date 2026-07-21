@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: three-tier-app
+  labels:
+    # PSA 'restricted' enforces: non-root, no privilege escalation,
+    # dropped capabilities, seccomp, read-only root FS
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn:    restricted
+    pod-security.kubernetes.io/audit:   restricted

@@ -1,0 +1,112 @@
+# ── Service: ClusterIP (external access via kubectl port-forward) ─────────
+# Was NodePort 30080 in the source repo's standalone-cluster design, but on
+# this shared obs-platform cluster that collides with
+# argocd/apps/argocd-server-nodeport.yaml's nodePort: 30080 (cluster-wide
+# allocation, not per-namespace) and isn't mapped to any host port anyway
+# (terraform/kind-config.yaml only forwards hostPort 8080 -> containerPort
+# 30080, reserved for ArgoCD). Reached the same way every other Service on
+# this platform is: `kubectl -n three-tier-app port-forward svc/frontend
+# 8081:8080` (see training plan Week 2 Step 8).
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: service
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+  type: ClusterIP
+---
+# ── Deployment ───────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/version: "1.0"
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels:
+        app: frontend
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/version: "1.0"
+        app.kubernetes.io/part-of: three-tier-app
+        app.kubernetes.io/component: frontend
+
+    spec:
+      serviceAccountName: frontend-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot:  true
+        runAsUser:     10001   # appuser — default nginx user (101) was DELETED
+        runAsGroup:    10001   # /etc/nginx/nginx.conf is root:appgroup 440
+        fsGroup:       10001   # GID 10001 required to pass group-read check
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: nginx-tmp
+          emptyDir:
+            medium: Memory   # mount at /tmp/nginx (NOT /tmp — too broad)
+        - name: nginx-cache
+          emptyDir: {}       # disk-backed; cache can grow
+      containers:
+        - name: frontend
+          image: docker.io/library/hardened-frontend:1.0
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          # No env vars: the upstream backend hostname/port is baked into
+          # frontend/nginx.conf at image build time (static config, not
+          # templated at container start).
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              # NET_BIND_SERVICE intentionally NOT granted — port 8080 does not need it
+          volumeMounts:
+            - name: nginx-tmp
+              mountPath: /tmp/nginx        # CRITICAL: exact path, not /tmp
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+          startupProbe:
+            httpGet: { path: /, port: http }   # NOT /health — nginx.conf has no /health location
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            failureThreshold: 10
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi  }
+            limits:   { cpu: 200m, memory: 128Mi }
+      terminationGracePeriodSeconds: 15

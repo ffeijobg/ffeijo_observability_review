@@ -1,0 +1,36 @@
+# ClusterRole: reusable, namespace-agnostic permission set
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: three-tier-app-viewer
+rules:
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs:     ['get', 'list']
+  - apiGroups: ['']
+    resources: ['configmaps']
+    verbs:     ['get']
+  # Absent: secrets, exec, write, delete — deliberately excluded
+---
+# RoleBinding: scopes ClusterRole to one namespace only
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backend-viewer-binding
+  namespace: three-tier-app
+subjects:
+  - kind: ServiceAccount
+    name: backend-sa
+    namespace: three-tier-app
+roleRef:
+  kind:     ClusterRole
+  name:     three-tier-app-viewer
+  apiGroup: rbac.authorization.k8s.io
+---
+# Zero-permission Role for frontend and database (empty rules = zero grants)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deny-all
+  namespace: three-tier-app
+rules: []   # Empty rules = zero API permissions — not an oversight, deliberate

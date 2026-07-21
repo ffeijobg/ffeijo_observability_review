@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability-platform
+  labels:
+    app.kubernetes.io/part-of: observability-platform
+    # Sidecar discovery label used by kube-prometheus-stack's Grafana sidecar
+    # to pick up datasource/dashboard ConfigMaps created in this namespace.
+    grafana_sidecar_scope: "true"

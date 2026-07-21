@@ -1,0 +1,323 @@
+# ./k8s/04-backend.yaml
+# =============================================================================
+# Backend Tier — Python 3.12 Flask/HTTP API (python:3.12-slim, hardened)
+# =============================================================================
+#
+# Image   : docker.io/library/hardened-backend:1.0  (136 MB)
+#           Pre-loaded into kind node via 'kind load docker-image'.
+#
+# Dockerfile-confirmed runtime parameters
+# ----------------------------------------
+#  Build    : multi-stage — builder (python:3.12-slim) → final (python:3.12-slim)
+#  User     : appuser  UID 10002 / appgroup GID 10002  (created in Layer 2)
+#  Port     : 5000  (ENV PORT=5000 / EXPOSE 5000)
+#  PYTHONPATH : /app/packages  (dependencies copied from builder stage)
+#  PYTHONDONTWRITEBYTECODE=1  → no .pyc files written; readOnlyRootFilesystem safe
+#  PYTHONUNBUFFERED=1         → stdout/stderr unbuffered (logs visible in kubectl logs)
+#  Health   : GET /health on port 5000 (confirmed by Dockerfile HEALTHCHECK)
+#
+#  File permissions in image:
+#    /app/app.py      root:appgroup  440  (r--r-----)
+#    /app/packages    root:appgroup  550  (r-xr-x---)
+#  → process must run as GID 10002 (appgroup) to pass the group-read check.
+#    Running as any other GID falls to 'other' bits (---) → EACCES.
+#
+# RBAC context (from 02-rbac.yaml)
+# ---------------------------------
+#  backend-sa is bound to three-tier-app-viewer (ClusterRole) via a
+#  namespace-scoped RoleBinding.  A Python HTTP API does NOT need to call
+#  the Kubernetes API, so automountServiceAccountToken is set to false.
+#  If service discovery or ConfigMap reads via the API server are needed,
+#  set it to true — the token will be mounted at
+#  /var/run/secrets/kubernetes.io/serviceaccount/.
+#
+# Database connectivity
+# ---------------------
+#  References the 'database-credentials' Secret defined in 03-database.yaml.
+#  The headless database Service provides the stable DNS name:
+#    database-0.database.three-tier-app.svc.cluster.local
+#  The short name 'database' also resolves within the same namespace.
+#  scram-sha-256 auth is enforced by the database image; psycopg2 >= 2.8
+#  and asyncpg >= 0.20 both support it natively — no extra config needed.
+#
+# CVE status : image accepted as-is (reviewed out-of-band, same policy as DB).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Service — ClusterIP
+#    Name MUST be 'backend-service' — this is the upstream hostname baked
+#    into the frontend image's /etc/nginx/nginx.conf (line 25).
+#    CoreDNS resolves it within the namespace as:
+#      backend-service.three-tier-app.svc.cluster.local
+#    Not exposed outside the cluster — all external traffic enters via
+#    the frontend Service.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: service
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
+      protocol: TCP
+  type: ClusterIP
+
+---
+# -----------------------------------------------------------------------------
+# 2. Deployment — hardened Python 3.12 backend
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/version: "1.0"
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/managed-by: kubectl
+    tier: backend   # selected by chaos/inject-pod-kill.sh's `-l tier=<value>`
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # zero-downtime rollout; never reduce below 1 ready pod
+
+  template:
+    metadata:
+      labels:
+        app: backend
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/version: "1.0"
+        app.kubernetes.io/part-of: three-tier-app
+        app.kubernetes.io/component: backend
+        tier: backend   # selected by chaos/inject-pod-kill.sh's `-l tier=<value>`
+
+    spec:
+      serviceAccountName: backend-sa
+      automountServiceAccountToken: false   # see RBAC context note above
+
+      # ── Pod-level security context ─────────────────────────────────────────
+      # UID 10002 / GID 10002 = appuser:appgroup  (created in Dockerfile Layer 2)
+      # This MUST match the Dockerfile USER directive exactly.
+      #
+      # Why this matters for this image specifically:
+      #   /app/app.py   → root:appgroup 440  (r--r-----)
+      #   /app/packages → root:appgroup 550  (r-xr-x---)
+      # The process needs GID 10002 to satisfy the group-read/execute check.
+      # Any other UID/GID falls to 'other' bits (---) → EACCES at open().
+      #
+      # fsGroup 10002 ensures emptyDir mounts (/tmp) are owned by appgroup
+      # so the process can write to them without a root chown pass.
+      securityContext:
+        runAsNonRoot:  true
+        runAsUser:     10002   # appuser (python:3.12-slim hardened)
+        runAsGroup:    10002   # appgroup
+        fsGroup:       10002
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Volumes ────────────────────────────────────────────────────────────
+      volumes:
+        # emptyDir for /tmp: Python's tempfile module, multipart uploads,
+        # and some WSGI/ASGI frameworks write temp files here.
+        # PYTHONDONTWRITEBYTECODE=1 (set in image ENV) prevents .pyc writes
+        # everywhere else, making all other paths safely read-only.
+        # Memory-backed keeps temp data off the node's disk.
+        - name: tmp
+          emptyDir:
+            medium: Memory
+
+      containers:
+        - name: backend
+          image: docker.io/library/hardened-backend:1.0
+          imagePullPolicy: Never   # pre-loaded into kind node
+
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+
+          # ── Environment ───────────────────────────────────────────────────
+          #
+          # Two sources — one rule: secrets in Secret, config in ConfigMap.
+          #
+          #   Secret  (database-credentials) → DB_USER, DB_PASSWORD only
+          #   ConfigMap (app-config)          → everything else
+          #
+          # $(VAR_NAME) substitution resolves from 'env' entries in order.
+          # All vars referenced in DATABASE_URL must appear above it.
+          # Note: $(VAR_NAME) resolves from 'env' only — NOT from envFrom.
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: "demo-3tier-app"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.namespace=demo-3tier-app"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector-gateway.observability-platform.svc.cluster.local:4318"
+            - name: OTEL_TRACES_EXPORTER
+              value: "otlp"
+            - name: OTEL_METRICS_EXPORTER
+              value: "otlp"
+            - name: OTEL_LOGS_EXPORTER
+              value: "otlp"
+            # ── Credentials from Secret (sensitive) ─────────────────────────
+            # Secret keys use DB_* convention — same name as the env var,
+            # so no key-name translation is needed on the backend side.
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: DB_USER           # matches Secret key exactly (DB_* convention)
+
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: DB_PASSWORD       # matches Secret key exactly (DB_* convention)
+
+            # ── Connectivity config from ConfigMap (non-sensitive) ───────────
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: DB_HOST           # "database" — headless Service DNS name
+
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: DB_PORT           # "5432"
+
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: DB_NAME           # "appdb" — not a credential
+
+            - name: DB_SSL_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: DB_SSL_MODE       # "disable" (lab); "require" for production
+
+            # ── Composed connection string ────────────────────────────────────
+            # Built from the six DB_* vars above. Kubernetes resolves
+            # $(VAR_NAME) from 'env' entries defined earlier in this list.
+            # The DB_* vars above MUST precede DATABASE_URL here.
+            - name: DATABASE_URL
+              value: "postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode=$(DB_SSL_MODE)"
+
+            # ── Runtime config from ConfigMap (non-sensitive) ────────────────
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: PORT              # "5000" — overrides Dockerfile ENV PORT=5000
+
+            - name: PYTHONDONTWRITEBYTECODE
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: PYTHONDONTWRITEBYTECODE   # "1" — no .pyc → readOnlyRootFilesystem safe
+
+            - name: PYTHONUNBUFFERED
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: PYTHONUNBUFFERED          # "1" → logs stream immediately to kubectl logs
+
+
+          # ── Container-level security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Root FS read-only.  Safe here because:
+            #   • PYTHONDONTWRITEBYTECODE=1 suppresses all .pyc writes
+            #   • App logs go to stdout/stderr (PYTHONUNBUFFERED=1)
+            #   • Only /tmp needs to be writable (volume-mounted above)
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL   # Python HTTP server needs no Linux capabilities
+
+          # ── Volume mounts ─────────────────────────────────────────────────
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          # ── Probes ────────────────────────────────────────────────────────
+          #
+          # Health endpoint confirmed by Dockerfile HEALTHCHECK:
+          #   CMD python3 -c "urllib.request.urlopen('http://localhost:5000/health')"
+          # Using httpGet here is equivalent and avoids spawning a python3
+          # subprocess on every probe interval (lower overhead).
+          #
+          # startupProbe gates liveness until the server is up.
+          # Python/WSGI apps typically start in 1–3 s; 35 s window is generous
+          # to cover cold starts under memory pressure on the kind node.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 10   # 5 + (10 × 3) = 35 s max startup window
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 20   # fires only after startupProbe succeeds
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4       # 4 × 15 s = 60 s grace before restart
+
+          # ── Resources ─────────────────────────────────────────────────────
+          # Sized for kind lab environment.
+          # Python/Flask is lighter than Node.js; 256Mi is sufficient for a
+          # typical CRUD API with psycopg2 connection pooling.
+          resources:
+            requests:
+              cpu:    100m
+              memory: 128Mi
+            limits:
+              cpu:    500m
+              memory: 256Mi
+
+      # ── Pod scheduling ──────────────────────────────────────────────────────
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30   # WSGI servers (Flask dev server, gunicorn,
+                                          # waitress) finish in-flight requests quickly;
+                                          # wire SIGTERM → graceful shutdown in app.py
+                                          # if using a custom server loop.
+  

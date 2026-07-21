@@ -1,0 +1,345 @@
+# ./k8s/03-database.yaml
+# -----------------------------------------------------------------------------
+# 1. Secret — PostgreSQL credentials (sensitive values only)
+#
+#  Key convention: DB_* throughout (not POSTGRES_*).
+#  ─────────────────────────────────────────────────────────────────────────
+#  The Secret carries ONLY values that grant access if leaked:
+#    DB_USER     — the login role psycopg2 authenticates as
+#    DB_PASSWORD — the scram-sha-256 credential
+#
+#  Non-sensitive database config (DB_HOST, DB_PORT, DB_NAME, DB_SSL_MODE)
+#  lives in the ConfigMap (03-configmap.yaml) so it can be logged, diffed,
+#  and committed safely without exposing credentials.
+#
+#  The database StatefulSet bridges POSTGRES_* ← DB_* via secretKeyRef
+#  because postgres:16-alpine expects POSTGRES_USER / POSTGRES_PASSWORD.
+#  The backend uses DB_USER / DB_PASSWORD directly — no naming mismatch.
+#
+#  ── Creation (NEVER commit passwords to YAML) ─────────────────────────
+#
+#    # Generate a strong random password
+#    export DB_PASSWORD="$(openssl rand -base64 32)"
+#
+#    # Create from env vars — dry-run preview then apply
+#    kubectl create secret generic database-credentials \
+#      --namespace=three-tier-app \
+#      --from-literal=DB_USER=appuser \
+#      --from-literal=DB_PASSWORD="${DB_PASSWORD}" \
+#      --dry-run=client -o yaml | kubectl apply -f -
+#
+#    # CI/CD pattern — inject from pipeline secret store
+#    kubectl create secret generic database-credentials \
+#      --namespace=three-tier-app \
+#      --from-literal=DB_USER="${POSTGRES_USER}" \
+#      --from-literal=DB_PASSWORD="${POSTGRES_PASSWORD}"
+#
+#  ── Production ────────────────────────────────────────────────────────
+#    External Secrets Operator  → sync from AWS Secrets Manager / GCP SM
+#    Sealed Secrets             → encrypted Secret committed to Git
+#    Vault Agent Sidecar        → injected at pod startup from HashiCorp Vault
+#    SOPS + age                 → encrypted YAML in Git, decrypted at apply
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Secret
+metadata:
+  name: database-credentials
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: credentials
+    app.kubernetes.io/managed-by: kubectl
+type: Opaque
+stringData:
+  # ── Sensitive credentials only ────────────────────────────────────────
+  # DB_USER and DB_PASSWORD use the DB_* naming convention so the backend
+  # can consume them directly without any key-name translation.
+  DB_USER:     "appuser"
+  DB_PASSWORD: "CHANGE_ME_BEFORE_APPLY"   # replace via kubectl command above
+
+---
+# -----------------------------------------------------------------------------
+# 2. PersistentVolumeClaim — PostgreSQL data directory
+#    kind default StorageClass (standard / rancher.io/local-path) provisions
+#    a hostPath PV automatically.  For non-kind clusters, set storageClassName
+#    explicitly.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: database-pvc
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: standard   # uncomment and set for non-kind clusters
+
+---
+# -----------------------------------------------------------------------------
+# 3. Service — Headless ClusterIP
+#    Headless (clusterIP: None) gives each StatefulSet pod a stable DNS A record:
+#      database-0.database.three-tier-app.svc.cluster.local
+#    The backend should connect using that FQDN (or the short name "database"
+#    within the same namespace) on port 5432.
+# -----------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: service
+spec:
+  selector:
+    app: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+  clusterIP: None   # headless — required for StatefulSet stable network identity
+
+---
+# -----------------------------------------------------------------------------
+# 4. StatefulSet — hardened PostgreSQL 16
+#    StatefulSet chosen over Deployment: guarantees ordered pod identity,
+#    stable DNS, and safe single-writer access to the PVC.
+# -----------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+  namespace: three-tier-app
+  labels:
+    app.kubernetes.io/name: database
+    app.kubernetes.io/version: "1.0"
+    app.kubernetes.io/part-of: three-tier-app
+    app.kubernetes.io/component: database
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  serviceName: database      # must match the headless Service name above
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+
+  template:
+    metadata:
+      labels:
+        app: database
+        app.kubernetes.io/name: database
+        app.kubernetes.io/version: "1.0"
+        app.kubernetes.io/part-of: three-tier-app
+        app.kubernetes.io/component: database
+      annotations:
+        # Prevents auto-mounting of service account token — defence-in-depth
+        # (also set explicitly via automountServiceAccountToken: false below)
+        kubectl.kubernetes.io/last-applied-configuration: ""
+
+    spec:
+      serviceAccountName: database-sa
+      automountServiceAccountToken: false   # database pod needs no API access
+
+      # ── Pod-level security context ─────────────────────────────────────────
+      # fsGroup 70 ensures that the PVC is mounted with GID 70 so that the
+      # postgres user (UID 70, GID 70) can read and write PGDATA without an
+      # additional chown pass by root.
+      securityContext:
+        runAsNonRoot:  true
+        runAsUser:     70     # postgres — Alpine convention (≠ Debian UID 999)
+        runAsGroup:    70     # postgres
+        fsGroup:       70     # PVC ownership on mount
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ── Volumes ────────────────────────────────────────────────────────────
+      volumes:
+        # PVC: persistent data directory
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: database-pvc
+
+        # Memory-backed emptyDir: unix socket directory
+        # postgres writes .s.PGSQL.5432 and .s.PGSQL.5432.lock here.
+        # The Dockerfile pre-creates this dir (chown postgres:postgres),
+        # but in Kubernetes the emptyDir overlay owns it as root by default;
+        # fsGroup: 70 corrects ownership on mount.
+        - name: postgres-run
+          emptyDir:
+            medium: Memory
+
+        # emptyDir: postgres temp files (sort_mem spill, temp relations, etc.)
+        - name: postgres-tmp
+          emptyDir: {}
+
+      # ── Container ──────────────────────────────────────────────────────────
+      containers:
+        - name: database
+          image: docker.io/library/hardened-database:1.0
+
+          # Never: image was loaded directly into the kind worker node via
+          # 'kind load docker-image'.  Attempting to pull would fail
+          # (no registry) and introduce unnecessary latency.
+          imagePullPolicy: Never
+
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+
+          # ── Environment ───────────────────────────────────────────────────
+          env:
+            # ── Bridge: postgres:16-alpine expects POSTGRES_* vars ───────────
+            # Our Secret uses DB_* convention (consistent with the backend).
+            # secretKeyRef / configMapKeyRef bridges the naming here so the
+            # Secret stays consistent while satisfying the postgres entrypoint.
+
+            - name: POSTGRES_USER        # postgres entrypoint var
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: DB_USER           # Secret key (DB_* convention)
+
+            - name: POSTGRES_PASSWORD    # postgres entrypoint var
+              valueFrom:
+                secretKeyRef:
+                  name: database-credentials
+                  key: DB_PASSWORD       # Secret key (DB_* convention)
+
+            - name: POSTGRES_DB          # postgres entrypoint var
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: DB_NAME           # ConfigMap key — db name is not a credential
+
+            # Override PGDATA to a sub-directory.
+            # The PVC root may contain a lost+found directory (ext4) or similar
+            # artefacts. initdb refuses to initialise a non-empty directory, so
+            # placing data one level deeper avoids that failure.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+
+            # Reinforce the auth method declared in the image ENV layer.
+            # This is belt-and-suspenders: POSTGRES_HOST_AUTH_METHOD is already
+            # set in the Dockerfile, but making it visible here documents intent.
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: scram-sha-256
+
+          # ── Container-level security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+
+            # Root filesystem is read-only.
+            # All writable paths postgres touches at runtime are mounted as
+            # volumes above (/var/lib/postgresql/data, /var/run/postgresql, /tmp).
+            # docker-entrypoint.sh only writes to those three directories;
+            # all other paths (binaries, libraries, init scripts) are read-only.
+            readOnlyRootFilesystem: true
+
+            capabilities:
+              drop:
+                - ALL      # drop all Linux capabilities — postgres does not need any
+
+            # Inherits runAsUser: 70 / runAsGroup: 70 from pod securityContext
+
+          # ── Volume mounts ─────────────────────────────────────────────────
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data   # PVC; PGDATA sits at ./pgdata
+            - name: postgres-run
+              mountPath: /var/run/postgresql         # unix socket; Memory-backed
+            - name: postgres-tmp
+              mountPath: /tmp                        # postgres temp operations
+
+          # ── Probes ────────────────────────────────────────────────────────
+          #
+          # Three-probe strategy:
+          #   startupProbe  → gives postgres up to 90 s to initialise (first run
+          #                   includes initdb + running init.sql); blocks liveness
+          #                   checks until startup succeeds.
+          #   readinessProbe → gates traffic; removed from Service endpoints when
+          #                    postgres is not accepting connections.
+          #   livenessProbe  → restarts the pod if postgres hangs irrecoverably.
+          #
+          # pg_isready exits 0 only when the server is accepting connections.
+          # Using 127.0.0.1 (TCP) rather than the unix socket ensures the probe
+          # works even if the socket directory has a permission race at startup.
+          # The -h 127.0.0.1 flag also means pg_hba.conf must allow local TCP
+          # connections from 127.0.0.1 — the default postgres config does.
+          #
+          # -d "$POSTGRES_DB" is required, not optional: libpq's fallback when
+          # no database is given is the *username*, so without it this probe
+          # tries to connect to a database literally named "appuser" (which
+          # never exists — only "appdb" does), fails with FATAL: database
+          # "appuser" does not exist, and readinessProbe never goes healthy.
+
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 10   # wait for docker-entrypoint.sh to start
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 18      # 10 + (18 × 5) = 100 s max startup window
+
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 30   # only fires after startupProbe succeeds
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5       # 5 × 15 s = 75 s grace before restart
+
+          # ── Resources ─────────────────────────────────────────────────────
+          # Sized conservatively for a local kind cluster.
+          # Scale cpu/memory limits for production workloads.
+          resources:
+            requests:
+              cpu:    100m
+              memory: 256Mi
+            limits:
+              cpu:    500m
+              memory: 512Mi
+
+      # ── Pod-level scheduling & lifecycle ────────────────────────────────────
+      restartPolicy: Always
+
+      # Gives postgres time to finish in-flight transactions, flush WAL, and
+      # complete a checkpoint before SIGKILL.  Default 30 s is too short for
+      # databases; 60 s is a safer floor.
+      terminationGracePeriodSeconds: 60
+
+      # ── Expected restart count note ────────────────────────────────────────
+      # kubectl get pods -n three-tier-app shows database-0 RESTARTS: 1
+      # This is normal on first boot: initdb + init.sql runs during the
+      # startupProbe window. If the initialisation exceeds the probe's
+      # initialDelaySeconds (10s), kubelet may kill the container once before
+      # the startupProbe reaches its 100s window. Subsequent starts are clean.
+      # A persistent RESTARTS count > 1 indicates a real problem (check logs).
