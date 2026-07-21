@@ -1,0 +1,6 @@
+git/          # Never ship git history
+*.env  .env*   # Secrets
+*.key  *.pem  *.p12  id_rsa*
+node_modules/  dist/  .cache/
+tests/  README*
+.github/  Jenkinsfile  docker-compose*

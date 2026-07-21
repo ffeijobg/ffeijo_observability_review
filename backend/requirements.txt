@@ -1,0 +1,21 @@
+# Runtime dependency for Tier 2 → Tier 3 (PostgreSQL) connectivity.
+# psycopg2-binary bundles its own libpq — no system build tools needed.
+# Pin to exact version for reproducible builds; update after running trivy.
+psycopg2-binary==2.9.9
+
+# OTel instrumentation (Week 2) — manual SDK setup in app.py, not the
+# opentelemetry-instrument CLI / opentelemetry-distro combo. Two reasons:
+#   1. `pip install --target=...` (this Dockerfile's multi-stage builder
+#      step) never generates console-script wrappers like
+#      opentelemetry-instrument — long-standing pip limitation (#3813) —
+#      so the entrypoint would fail with "executable file not found".
+#   2. There's no official OTel auto-instrumentor for Python's stdlib
+#      http.server (only Flask/Django/FastAPI/WSGI/ASGI are supported), so
+#      opentelemetry-instrument would never have wrapped requests in an
+#      HTTP span or emitted the http.server.duration metric the Sloth SLOs
+#      key on, even if it did run.
+# opentelemetry-sdk (not opentelemetry-distro) is enough since app.py wires
+# the TracerProvider/MeterProvider/LoggerProvider up directly.
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-psycopg2

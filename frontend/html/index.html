@@ -1,0 +1,953 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3-Tier Hardened App</title>
+
+    <!--
+    ╔═══════════════════════════════════════════════════════════════════╗
+    ║  CSP COMPATIBILITY NOTE                                           ║
+    ║                                                                   ║
+    ║  The nginx.conf in this guide ships with:                         ║
+    ║    Content-Security-Policy                                        ║
+    ║      "default-src 'self'; script-src 'self';"                     ║
+    ║                                                                   ║
+    ║  Inline <style> and <script> blocks are blocked by that policy.   ║
+    ║                                                                   ║
+    ║  Option A — Lab / interview demo (this file as-is):               ║
+    ║    Update nginx.conf to:                                          ║
+    ║      "default-src 'self';                                         ║
+    ║       style-src  'self' 'unsafe-inline';                          ║
+    ║       script-src 'self' 'unsafe-inline';"                         ║
+    ║                                                                   ║
+    ║  Option B — Production pattern (recommended):                     ║
+    ║    Move the <style> block  → html/style.css                       ║
+    ║    Move the <script> block → html/app.js                          ║
+    ║    Replace with:                                                   ║
+    ║      <link rel="stylesheet" href="/style.css" />                  ║
+    ║      <script src="/app.js" defer></script>                        ║
+    ║    The Dockerfile COPY step already copies the entire html/        ║
+    ║    directory, so both files are included automatically.            ║
+    ║    This keeps the strict CSP intact with no 'unsafe-inline'.       ║
+    ╚═══════════════════════════════════════════════════════════════════╝
+    -->
+
+    <style>
+        /* ── Reset ──────────────────────────────────────────────────── */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        /* ── Token system ───────────────────────────────────────────── */
+        :root {
+            /* Surfaces */
+            --bg:          #0b0e14;
+            --surface:     #131720;
+            --surface-2:   #1a2030;
+            --border:      #262d3d;
+            --border-soft: #1e2538;
+
+            /* Text */
+            --text:        #cdd6f4;
+            --muted:       #6c7a9a;
+            --dim:         #3d4a66;
+
+            /* Tier accent colours — match each technology's brand */
+            --t1:          #4a9eff;   /* nginx blue       */
+            --t2:          #4ec994;   /* Python green     */
+            --t3:          #f0a844;   /* PostgreSQL amber */
+
+            /* State */
+            --ok:          #4ec994;
+            --err:         #f38ba8;
+            --warn:        #f0a844;
+            --pending:     #6c7a9a;
+
+            /* Typography */
+            --font-ui:     'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+            --font-mono:   'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+
+            /* Geometry */
+            --r:           6px;
+            --r-sm:        4px;
+        }
+
+        /* ── Base ───────────────────────────────────────────────────── */
+        html { background: var(--bg); }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--font-ui);
+            font-size: 14px;
+            line-height: 1.6;
+            min-height: 100vh;
+            padding: 2.5rem 1.25rem 4rem;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        /* ── Tier pipeline ──────────────────────────────────────────── */
+        /*
+         * The signature element: a request-flow pipeline that lights up
+         * as each tier responds. Encodes the architecture visually so
+         * the page itself teaches the 3-tier model.
+         */
+        .pipeline {
+            display: flex;
+            align-items: center;
+            gap: 0;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+            padding: 1.25rem 1.5rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--r);
+            margin-bottom: 1.5rem;
+        }
+
+        .pipe-node {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.35rem;
+            flex-shrink: 0;
+        }
+
+        .pipe-icon {
+            width: 44px;
+            height: 44px;
+            border-radius: 10px;
+            border: 1.5px solid var(--border);
+            background: var(--surface-2);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            transition: border-color 0.3s, box-shadow 0.3s;
+            position: relative;
+        }
+
+        /* Per-tier glow colours */
+        .pipe-node.t1 .pipe-icon { border-color: var(--t1); box-shadow: 0 0 0 0 var(--t1); }
+        .pipe-node.t2 .pipe-icon { border-color: var(--t2); box-shadow: 0 0 0 0 var(--t2); }
+        .pipe-node.t3 .pipe-icon { border-color: var(--t3); box-shadow: 0 0 0 0 var(--t3); }
+        .pipe-node.browser .pipe-icon { border-color: var(--dim); }
+
+        /* Active pulse when a request is in flight */
+        .pipe-node.active .pipe-icon {
+            box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 20%, transparent);
+            animation: pulse 0.9s ease-in-out infinite alternate;
+        }
+        .pipe-node.t1.active .pipe-icon { animation-name: pulse-t1; }
+        .pipe-node.t2.active .pipe-icon { animation-name: pulse-t2; }
+        .pipe-node.t3.active .pipe-icon { animation-name: pulse-t3; }
+
+        @keyframes pulse-t1 {
+            from { box-shadow: 0 0 0 2px transparent; }
+            to   { box-shadow: 0 0 10px 3px color-mix(in srgb, var(--t1) 35%, transparent); }
+        }
+        @keyframes pulse-t2 {
+            from { box-shadow: 0 0 0 2px transparent; }
+            to   { box-shadow: 0 0 10px 3px color-mix(in srgb, var(--t2) 35%, transparent); }
+        }
+        @keyframes pulse-t3 {
+            from { box-shadow: 0 0 0 2px transparent; }
+            to   { box-shadow: 0 0 10px 3px color-mix(in srgb, var(--t3) 35%, transparent); }
+        }
+
+        .pipe-label {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            color: var(--muted);
+            text-align: center;
+            line-height: 1.3;
+        }
+
+        .pipe-label strong {
+            display: block;
+            font-size: 11px;
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        /* Animated arrow between nodes */
+        .pipe-arrow {
+            flex: 1;
+            min-width: 20px;
+            max-width: 48px;
+            height: 2px;
+            background: var(--dim);
+            position: relative;
+            margin-bottom: 1.5rem;
+            flex-shrink: 0;
+        }
+
+        .pipe-arrow::after {
+            content: '';
+            position: absolute;
+            right: -5px;
+            top: -4px;
+            border: 5px solid transparent;
+            border-left-color: var(--dim);
+        }
+
+        /* ── Header ─────────────────────────────────────────────────── */
+        header {
+            margin-bottom: 1.5rem;
+        }
+
+        header h1 {
+            font-size: 1.35rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: var(--text);
+            margin-bottom: 0.25rem;
+        }
+
+        .header-sub {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: var(--muted);
+        }
+
+        /* ── Card ───────────────────────────────────────────────────── */
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--r);
+            margin-bottom: 1.25rem;
+            overflow: hidden;
+        }
+
+        .card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.85rem 1.25rem;
+            border-bottom: 1px solid var(--border-soft);
+            gap: 0.75rem;
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .route-tag {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--muted);
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--r-sm);
+            padding: 2px 7px;
+            white-space: nowrap;
+        }
+
+        .card-body {
+            padding: 1.25rem;
+        }
+
+        /* ── Health grid ─────────────────────────────────────────────── */
+        .health-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 0.75rem;
+        }
+
+        .health-tile {
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--r);
+            padding: 0.85rem 1rem;
+        }
+
+        .health-tile-label {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--muted);
+            margin-bottom: 0.4rem;
+        }
+
+        .health-tile-value {
+            font-size: 14px;
+            font-weight: 700;
+            font-family: var(--font-mono);
+        }
+
+        .ok      { color: var(--ok); }
+        .err     { color: var(--err); }
+        .pending { color: var(--pending); }
+        .warn    { color: var(--warn); }
+
+        /* ── Table ───────────────────────────────────────────────────── */
+        .table-wrap { overflow-x: auto; }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead th {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--muted);
+            padding: 0.5rem 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+
+        tbody td {
+            padding: 0.6rem 0.75rem;
+            border-bottom: 1px solid var(--border-soft);
+            vertical-align: top;
+            font-size: 13px;
+        }
+
+        tbody tr:last-child td { border-bottom: none; }
+
+        tbody tr:hover { background: var(--surface-2); }
+
+        .td-id  { font-family: var(--font-mono); font-size: 12px; color: var(--muted); width: 50px; }
+        .td-key { font-family: var(--font-mono); color: var(--t1); }
+        .td-ts  { font-family: var(--font-mono); font-size: 11px; color: var(--dim); white-space: nowrap; }
+
+        .empty-row td {
+            text-align: center;
+            padding: 2.5rem 0;
+            color: var(--muted);
+            font-style: italic;
+            font-size: 13px;
+        }
+
+        .err-row td {
+            text-align: center;
+            padding: 1.5rem 0;
+            color: var(--err);
+            font-size: 13px;
+        }
+
+        /* ── Form ────────────────────────────────────────────────────── */
+        .form-row {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+            flex: 1;
+            min-width: 140px;
+        }
+
+        .form-label {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            color: var(--muted);
+        }
+
+        .form-input {
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--r);
+            padding: 0.5rem 0.75rem;
+            color: var(--text);
+            font-family: var(--font-mono);
+            font-size: 13px;
+            outline: none;
+            transition: border-color 0.15s;
+            width: 100%;
+        }
+
+        .form-input:focus      { border-color: var(--t1); }
+        .form-input::placeholder { color: var(--dim); }
+
+        /* ── Buttons ─────────────────────────────────────────────────── */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.5rem 1rem;
+            border-radius: var(--r);
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            color: var(--text);
+            cursor: pointer;
+            font-size: 13px;
+            font-family: var(--font-ui);
+            font-weight: 500;
+            transition: background 0.15s, border-color 0.15s;
+            white-space: nowrap;
+            text-decoration: none;
+        }
+
+        .btn:hover       { background: var(--border); }
+
+        .btn-primary {
+            background: var(--t1);
+            border-color: var(--t1);
+            color: #0b0e14;
+            font-weight: 700;
+        }
+
+        .btn-primary:hover    { opacity: 0.88; }
+        .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+
+        .card-actions {
+            display: flex;
+            justify-content: flex-end;
+            padding: 0.75rem 1.25rem;
+            border-top: 1px solid var(--border-soft);
+        }
+
+        /* ── Toast ───────────────────────────────────────────────────── */
+        #toast {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--r);
+            padding: 0.65rem 1rem;
+            font-size: 13px;
+            font-family: var(--font-mono);
+            max-width: 320px;
+            opacity: 0;
+            transform: translateY(8px);
+            transition: opacity 0.2s, transform 0.2s;
+            pointer-events: none;
+            z-index: 200;
+        }
+
+        #toast.show     { opacity: 1; transform: translateY(0); }
+        #toast.toast-ok { border-color: var(--ok);  color: var(--ok); }
+        #toast.toast-err{ border-color: var(--err); color: var(--err); }
+
+        /* ── Footer ──────────────────────────────────────────────────── */
+        footer {
+            margin-top: 2.5rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--border-soft);
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--dim);
+            text-align: center;
+            line-height: 2;
+        }
+
+        /* ── Responsive ──────────────────────────────────────────────── */
+        @media (max-width: 560px) {
+            .pipeline { gap: 0.5rem; }
+            .pipe-arrow { min-width: 12px; }
+            .health-grid { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         HEADER
+         ═══════════════════════════════════════════════════════════════ -->
+    <header>
+        <h1>3-Tier Hardened Application</h1>
+        <p class="header-sub">
+            Kind cluster &nbsp;·&nbsp; Pod Security Admission: restricted &nbsp;·&nbsp;
+            namespace: three-tier-app
+        </p>
+    </header>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         TIER PIPELINE — request flow visualiser
+         Each node pulses while a request to that tier is in flight.
+         Browser → nginx (Tier 1) → Python backend (Tier 2) → PostgreSQL (Tier 3)
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="pipeline" role="img" aria-label="Request flow: Browser to nginx to Python to PostgreSQL">
+
+        <div class="pipe-node browser" id="pipe-browser">
+            <div class="pipe-icon">🌐</div>
+            <div class="pipe-label"><strong>Browser</strong>port 30080</div>
+        </div>
+
+        <div class="pipe-arrow"></div>
+
+        <div class="pipe-node t1" id="pipe-t1">
+            <div class="pipe-icon">⬡</div>
+            <div class="pipe-label">
+                <strong>Tier 1 — nginx</strong>
+                UID 10001 · :8080
+            </div>
+        </div>
+
+        <div class="pipe-arrow"></div>
+
+        <div class="pipe-node t2" id="pipe-t2">
+            <div class="pipe-icon">🐍</div>
+            <div class="pipe-label">
+                <strong>Tier 2 — Python</strong>
+                UID 10002 · :5000
+            </div>
+        </div>
+
+        <div class="pipe-arrow"></div>
+
+        <div class="pipe-node t3" id="pipe-t3">
+            <div class="pipe-icon">🐘</div>
+            <div class="pipe-label">
+                <strong>Tier 3 — PostgreSQL</strong>
+                UID 999 · :5432
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 1 — System health
+         ───────────────────────────────────────────────────────────────
+         GET /api/health
+         nginx proxies → backend-service:5000/health
+         Backend queries PostgreSQL and reports db connectivity.
+         Expected response:
+           { "status": "ok", "db": "connected", "uptime_seconds": 42 }
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">System Health</span>
+            <span class="route-tag">GET /api/health</span>
+        </div>
+        <div class="card-body">
+            <div class="health-grid">
+                <div class="health-tile">
+                    <div class="health-tile-label">Tier 1 — nginx</div>
+                    <!-- nginx is serving this page, so it is always up -->
+                    <div class="health-tile-value ok" id="h-t1">● serving</div>
+                </div>
+                <div class="health-tile">
+                    <div class="health-tile-label">Tier 2 — backend</div>
+                    <div class="health-tile-value pending" id="h-t2">● checking…</div>
+                </div>
+                <div class="health-tile">
+                    <div class="health-tile-label">Tier 3 — database</div>
+                    <div class="health-tile-value pending" id="h-t3">● checking…</div>
+                </div>
+                <div class="health-tile">
+                    <div class="health-tile-label">Round-trip latency</div>
+                    <div class="health-tile-value pending" id="h-latency">—</div>
+                </div>
+            </div>
+        </div>
+        <div class="card-actions">
+            <button class="btn" onclick="checkHealth()">Refresh Health</button>
+        </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 2 — Database records (read path)
+         ───────────────────────────────────────────────────────────────
+         GET /api/data
+         nginx proxies → backend-service:5000/data
+         Backend executes: SELECT id, key, value, created_at FROM app_data
+                           ORDER BY id DESC
+         Expected response:
+           { "records": [
+               { "id": 1, "key": "...", "value": "...", "created_at": "..." }
+             ]
+           }
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Database Records</span>
+            <span class="route-tag">GET /api/data → SELECT * FROM app_data</span>
+        </div>
+        <div class="card-body">
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Key</th>
+                            <th>Value</th>
+                            <th>Created At (UTC)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="records-body">
+                        <tr class="empty-row">
+                            <td colspan="4">Loading records…</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card-actions">
+            <button class="btn" onclick="fetchRecords()">Refresh Records</button>
+        </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SECTION 3 — Add record (write path)
+         ───────────────────────────────────────────────────────────────
+         POST /api/data  body: { "key": "...", "value": "..." }
+         nginx proxies → backend-service:5000/data
+         Backend executes: INSERT INTO app_data (key, value) VALUES ($1, $2)
+                           RETURNING id, key, value, created_at
+         Expected response:
+           { "id": 3, "key": "...", "value": "...", "created_at": "..." }
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Add Record</span>
+            <span class="route-tag">POST /api/data → INSERT INTO app_data</span>
+        </div>
+        <div class="card-body">
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label" for="rec-key">Key</label>
+                    <input
+                        class="form-input"
+                        type="text"
+                        id="rec-key"
+                        placeholder="e.g. db-host"
+                        maxlength="255"
+                        autocomplete="off"
+                    />
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="rec-value">Value</label>
+                    <input
+                        class="form-input"
+                        type="text"
+                        id="rec-value"
+                        placeholder="e.g. postgres-service.three-tier-app.svc"
+                        maxlength="1000"
+                        autocomplete="off"
+                    />
+                </div>
+                <button class="btn btn-primary" id="submit-btn" onclick="addRecord()">
+                    Add Record
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <footer>
+        <span>nginx:1.28.3 · python:3.12 · postgresql:16</span><br/>
+        <span>PSA: restricted · capabilities: [] · readOnlyRootFilesystem: true · automountServiceAccountToken: false</span>
+    </footer>
+
+</div><!-- /container -->
+
+<!-- Toast notification -->
+<div id="toast" role="status" aria-live="polite"></div>
+
+<!--
+═════════════════════════════════════════════════════════════════════════
+  JAVASCRIPT — 3-tier integration layer
+
+  All API calls go through /api/ which nginx reverse-proxies to:
+    backend-service:5000  (ClusterIP, not externally reachable)
+
+  nginx.conf rule:  location /api/ { proxy_pass http://backend-service:5000/; }
+
+  URL rewriting:    /api/health  → backend:5000/health
+                    /api/data    → backend:5000/data
+
+  Security:
+    - escHtml() sanitises all user-supplied strings before innerHTML
+    - No eval(), no dynamic script loading
+    - Content-Type: application/json set explicitly on every POST
+═════════════════════════════════════════════════════════════════════════
+-->
+<script>
+    'use strict';
+
+    // ──────────────────────────────────────────────────────────────
+    // API root.
+    // nginx proxies /api/* → backend-service:5000/*
+    // ──────────────────────────────────────────────────────────────
+    const API = '/api';
+
+    // ──────────────────────────────────────────────────────────────
+    // Pipeline node animation helpers
+    // Call activateTier('t2') when a request to Tier 2 starts,
+    // deactivateTier('t2') when it resolves.
+    // ──────────────────────────────────────────────────────────────
+    function activateTier(tier) {
+        document.getElementById(`pipe-${tier}`)?.classList.add('active');
+    }
+    function deactivateTier(tier) {
+        document.getElementById(`pipe-${tier}`)?.classList.remove('active');
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // HEALTH CHECK
+    //
+    // GET /api/health
+    //   → nginx (tier 1, already up — serving this page)
+    //   → backend-service:5000/health          (tier 2)
+    //   → backend pings PostgreSQL             (tier 3)
+    //
+    // Expected JSON:
+    //   { "status": "ok", "db": "connected", "uptime_seconds": 42 }
+    // ──────────────────────────────────────────────────────────────
+    async function checkHealth() {
+        const t2El  = document.getElementById('h-t2');
+        const t3El  = document.getElementById('h-t3');
+        const latEl = document.getElementById('h-latency');
+
+        // Reset to pending state
+        setStatus(t2El,  'pending', '● checking…');
+        setStatus(t3El,  'pending', '● checking…');
+        setStatus(latEl, 'pending', '—');
+
+        activateTier('t1');
+        activateTier('t2');
+
+        const t0 = performance.now();
+
+        try {
+            const res  = await fetch(`${API}/health`, { cache: 'no-store' });
+            const ms   = Math.round(performance.now() - t0);
+            const data = await res.json();
+
+            deactivateTier('t1');
+            deactivateTier('t2');
+
+            // ── Tier 2 status ──
+            const backendOk = res.ok && data.status === 'ok';
+            setStatus(t2El,
+                backendOk ? 'ok' : 'err',
+                backendOk ? '● ok' : `● ${escHtml(data.status ?? 'error')}`
+            );
+
+            // ── Tier 3 status (backend reports db connectivity) ──
+            const dbOk = data.db === 'connected';
+            activateTier('t3');
+            setStatus(t3El,
+                dbOk ? 'ok' : 'err',
+                dbOk ? '● connected' : `● ${escHtml(data.db ?? 'unreachable')}`
+            );
+            deactivateTier('t3');
+
+            // ── Latency ──
+            const latClass = ms < 50 ? 'ok' : ms < 250 ? 'warn' : 'err';
+            setStatus(latEl, latClass, `${ms} ms`);
+
+            if (data.uptime_seconds !== undefined) {
+                latEl.title = `Backend uptime: ${data.uptime_seconds}s`;
+            }
+
+        } catch (err) {
+            const ms = Math.round(performance.now() - t0);
+            deactivateTier('t1');
+            deactivateTier('t2');
+            deactivateTier('t3');
+            setStatus(t2El,  'err', '● unreachable');
+            setStatus(t3El,  'err', '● unknown');
+            setStatus(latEl, 'err', `${ms} ms`);
+            showToast(`Health check failed: ${err.message}`, 'err');
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // FETCH RECORDS (read path — all 3 tiers)
+    //
+    // GET /api/data
+    //   → nginx → backend-service:5000/data
+    //   → SELECT id, key, value, created_at FROM app_data ORDER BY id DESC
+    //
+    // Expected JSON:
+    //   { "records": [
+    //       { "id": 1, "key": "...", "value": "...", "created_at": "..." }
+    //     ]
+    //   }
+    // ──────────────────────────────────────────────────────────────
+    async function fetchRecords() {
+        const tbody = document.getElementById('records-body');
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="4">Loading…</td></tr>';
+
+        activateTier('t1');
+        activateTier('t2');
+        activateTier('t3');
+
+        try {
+            const res  = await fetch(`${API}/data`, { cache: 'no-store' });
+            deactivateTier('t1');
+            deactivateTier('t2');
+            deactivateTier('t3');
+
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+            const data = await res.json();
+            renderRecords(data.records ?? []);
+
+        } catch (err) {
+            deactivateTier('t1');
+            deactivateTier('t2');
+            deactivateTier('t3');
+            tbody.innerHTML = `<tr class="err-row">
+                <td colspan="4">Error loading records: ${escHtml(err.message)}</td>
+            </tr>`;
+        }
+    }
+
+    function renderRecords(records) {
+        const tbody = document.getElementById('records-body');
+
+        if (!records.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="4">No records yet — add one below to write through all 3 tiers.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = records.map(r => `
+            <tr>
+                <td class="td-id">#${escHtml(String(r.id))}</td>
+                <td class="td-key">${escHtml(r.key)}</td>
+                <td>${escHtml(r.value ?? '—')}</td>
+                <td class="td-ts">${escHtml(formatTs(r.created_at))}</td>
+            </tr>
+        `).join('');
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ADD RECORD (write path — all 3 tiers)
+    //
+    // POST /api/data   body: { "key": "...", "value": "..." }
+    //   → nginx → backend-service:5000/data
+    //   → INSERT INTO app_data (key, value) VALUES ($1, $2)
+    //     RETURNING id, key, value, created_at
+    //
+    // Expected JSON:
+    //   { "id": 3, "key": "...", "value": "...", "created_at": "..." }
+    //
+    // On duplicate key:
+    //   HTTP 409  { "error": "key already exists" }
+    // ──────────────────────────────────────────────────────────────
+    async function addRecord() {
+        const keyEl = document.getElementById('rec-key');
+        const valEl = document.getElementById('rec-value');
+        const btn   = document.getElementById('submit-btn');
+
+        const key   = keyEl.value.trim();
+        const value = valEl.value.trim();
+
+        if (!key) {
+            showToast('Key is required.', 'err');
+            keyEl.focus();
+            return;
+        }
+
+        btn.disabled    = true;
+        btn.textContent = 'Saving…';
+
+        activateTier('t1');
+        activateTier('t2');
+        activateTier('t3');
+
+        try {
+            const res = await fetch(`${API}/data`, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ key, value }),
+            });
+
+            deactivateTier('t1');
+            deactivateTier('t2');
+            deactivateTier('t3');
+
+            if (!res.ok) {
+                // Parse backend error (e.g. 409 duplicate key)
+                const errBody = await res.json().catch(() => ({}));
+                throw new Error(errBody.error ?? `HTTP ${res.status}`);
+            }
+
+            await res.json();               // consume and discard the body
+            keyEl.value = '';
+            valEl.value = '';
+            showToast(`Record "${key}" saved to PostgreSQL.`, 'ok');
+            await fetchRecords();           // refresh table to prove DB round-trip
+
+        } catch (err) {
+            deactivateTier('t1');
+            deactivateTier('t2');
+            deactivateTier('t3');
+            showToast(`Failed: ${err.message}`, 'err');
+        } finally {
+            btn.disabled    = false;
+            btn.textContent = 'Add Record';
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // HELPERS
+    // ──────────────────────────────────────────────────────────────
+
+    // setStatus: update a health tile value with the correct CSS class
+    function setStatus(el, cls, text) {
+        if (!el) return;
+        el.className   = `health-tile-value ${cls}`;
+        el.textContent = text;
+    }
+
+    // escHtml: prevent XSS when inserting user-supplied strings into innerHTML.
+    // All data that came from the API or from user input must pass through this.
+    function escHtml(str) {
+        return String(str)
+            .replace(/&/g,  '&amp;')
+            .replace(/</g,  '&lt;')
+            .replace(/>/g,  '&gt;')
+            .replace(/"/g,  '&quot;')
+            .replace(/'/g,  '&#39;');
+    }
+
+    // formatTs: human-readable UTC timestamp from ISO-8601 string
+    function formatTs(ts) {
+        if (!ts) return '—';
+        try {
+            return new Date(ts).toLocaleString('en-US', {
+                month:   'short',
+                day:     'numeric',
+                year:    'numeric',
+                hour:    '2-digit',
+                minute:  '2-digit',
+                second:  '2-digit',
+                hour12:  false,
+                timeZone: 'UTC',
+                timeZoneName: 'short',
+            });
+        } catch {
+            return String(ts);
+        }
+    }
+
+    // showToast: 3-second corner notification
+    let _toastTimer;
+    function showToast(msg, type) {
+        const el    = document.getElementById('toast');
+        el.textContent = msg;
+        el.className   = `show toast-${type}`;
+        clearTimeout(_toastTimer);
+        _toastTimer = setTimeout(() => { el.className = ''; }, 3500);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // INIT — run both fetches on page load
+    // ──────────────────────────────────────────────────────────────
+    checkHealth();
+    fetchRecords();
+</script>
+</body>
+</html>
